@@ -1,0 +1,147 @@
+name: Auto Release
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Check version
+        id: check
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          echo "Local version: $PACKAGE_VERSION"
+          
+          # Check if version exists on npm
+          NPM_VERSION=$(npm view @struktos/cli version 2>/dev/null || echo "0.0.0")
+          echo "NPM version: $NPM_VERSION"
+          
+          if [ "$PACKAGE_VERSION" != "$NPM_VERSION" ]; then
+            echo "Version changed: $NPM_VERSION -> $PACKAGE_VERSION"
+            echo "should_release=true" >> $GITHUB_OUTPUT
+            echo "version=$PACKAGE_VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "Version unchanged"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [check-version, test]
+    if: needs.check-version.outputs.should_release == 'true'
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create tag
+        run: |
+          VERSION=${{ needs.check-version.outputs.version }}
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+
+      - name: Extract changelog
+        id: changelog
+        run: |
+          VERSION=${{ needs.check-version.outputs.version }}
+          
+          # Extract changelog section for this version
+          CHANGELOG=$(awk "/## \[$VERSION\]/,/## \[/" CHANGELOG.md | head -n -1)
+          
+          if [ -z "$CHANGELOG" ]; then
+            CHANGELOG="Release v$VERSION"
+          fi
+          
+          # Save to file for multi-line handling
+          echo "$CHANGELOG" > release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: v${{ needs.check-version.outputs.version }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "## 🎉 Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** v${{ needs.check-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Published to:**" >> $GITHUB_STEP_SUMMARY
+          echo "- GitHub Releases" >> $GITHUB_STEP_SUMMARY
+          echo "- npm: [@struktos/cli](https://www.npmjs.com/package/@struktos/prisma)" >> $GITHUB_STEP_SUMMARY
